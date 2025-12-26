@@ -209,6 +209,10 @@ class MainWindow(QtWidgets.QMainWindow):
         # <-- This is the call you asked about:
         self.engine.set_eq(low, mid, high)
 
+    def on_volume_change(self, deck: str, val: int):
+        gain = val / 100.0
+        self.engine.set_channel_gain(deck, gain)
+        self.deck_widgets[deck]["vol_label"].setText(f"{val}%")
 
 
 def run_app():

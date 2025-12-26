@@ -3,9 +3,14 @@ from typing import Dict
 from PyQt6 import QtWidgets, QtCore
 import numpy as np
 from pathlib import Path
+import pyqtgraph as pg
 
 from app.audio.engine import AudioEngine, SR
 from app.io.decode import load_audio_to_pcm
+from app.analysis.beatgrid import estimate_bpm_dj
+from app.analysis.wave import waveform_peaks
+
+
 
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self):
@@ -47,6 +52,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.timer.timeout.connect(self.on_tick)
         self.timer.start(50)  # 20 fps
 
+        # Set base BPM levels
+        self.base_bpm = {"A": 0.0, "B": 0.0}
+
+
     # ----- Deck UI builders -----
     def _build_deck_ui(self, deck: str) -> QtWidgets.QLayout:
         col = QtWidgets.QVBoxLayout()
@@ -62,6 +71,14 @@ class MainWindow(QtWidgets.QMainWindow):
         track_label.setWordWrap(True)
         col.addWidget(track_label)
 
+        # BPMs
+        bpm_base_label = QtWidgets.QLabel("Base BPM: --")
+        bpm_cur_label  = QtWidgets.QLabel("BPM @ Rate: --")
+        for lbl in (bpm_base_label, bpm_cur_label):
+            lbl.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        col.addWidget(bpm_base_label)
+        col.addWidget(bpm_cur_label)
+
 
         # Load & Play
         btn_row = QtWidgets.QHBoxLayout()
@@ -76,11 +93,25 @@ class MainWindow(QtWidgets.QMainWindow):
         rate_group = QtWidgets.QGroupBox("Rate")
         rgl = QtWidgets.QVBoxLayout(rate_group)
         rate_slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Vertical)
-        rate_slider.setMinimum(50); rate_slider.setMaximum(150); rate_slider.setValue(100)
+        rate_slider.setMinimum(90); rate_slider.setMaximum(110); rate_slider.setValue(100)
         rate_label = QtWidgets.QLabel("1.00x")
         rate_slider.valueChanged.connect(lambda v: self.on_rate_change(deck, v))
         rgl.addWidget(rate_slider, alignment=QtCore.Qt.AlignmentFlag.AlignHCenter)
         rgl.addWidget(rate_label, alignment=QtCore.Qt.AlignmentFlag.AlignHCenter)
+
+        # Volume (vertical)
+        vol_group = QtWidgets.QGroupBox("Volume")
+        vgl = QtWidgets.QVBoxLayout(vol_group)
+        vol_slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Vertical)
+        vol_slider.setMinimum(0)
+        vol_slider.setMaximum(100)
+        vol_slider.setValue(100)  # start at full volume
+        vol_slider.setTickPosition(QtWidgets.QSlider.TickPosition.TicksRight)
+        vol_label = QtWidgets.QLabel("100%")
+        vol_slider.valueChanged.connect(lambda v: self.on_volume_change(deck, v))
+        vgl.addWidget(vol_slider, alignment=QtCore.Qt.AlignmentFlag.AlignHCenter)
+        vgl.addWidget(vol_label, alignment=QtCore.Qt.AlignmentFlag.AlignHCenter)
+
 
         # EQ (vertical sliders)
         eq_group = QtWidgets.QGroupBox("EQ (dB)")
@@ -94,9 +125,10 @@ class MainWindow(QtWidgets.QMainWindow):
             v.addWidget(label, alignment=QtCore.Qt.AlignmentFlag.AlignHCenter)
             eql.addLayout(v)
 
-        # Put rate + EQ side by side
+        # Put rate + volume + EQ side by side
         top_row = QtWidgets.QHBoxLayout()
         top_row.addWidget(rate_group)
+        top_row.addWidget(vol_group) 
         top_row.addWidget(eq_group)
         col.addLayout(top_row)
 
@@ -124,15 +156,48 @@ class MainWindow(QtWidgets.QMainWindow):
             cues.addWidget(go_btn, 1, i-1)
         col.addLayout(cues)
 
+
+        wave_plot = pg.PlotWidget(
+            background="#111",
+            enableMenu=False,
+        )
+        wave_plot.setMouseEnabled(x=False, y=False)
+        wave_plot.hideAxis('left')   # no left axis
+        wave_plot.hideAxis('bottom') # no bottom axis
+        col.addWidget(wave_plot)
+        
+
+        # Playhead line
+        playhead = pg.InfiniteLine(
+            pos=0,
+            angle=90,
+            pen=pg.mkPen('y', width=2)
+        )
+        wave_plot.addItem(playhead)
+       
+
+
         # Store widgets for this deck
         self.deck_widgets[deck] = {
             "rate_slider": rate_slider, "rate_label": rate_label,
+            "vol_slider": vol_slider,   "vol_label": vol_label,
             "low_slider": low_slider, "low_label": low_label,
             "mid_slider": mid_slider, "mid_label": mid_label,
             "high_slider": high_slider, "high_label": high_label,
             "seek_slider": seek_slider,
             "track_label": track_label,
+            "bpm_base_label": bpm_base_label,
+            "bpm_cur_label": bpm_cur_label,
+            "wave_plot":wave_plot,
+            "beat_lines":[],
+            "playhead_line":playhead,
+            "wave_peaks":None,
         }
+        self.engine.set_channel_gain(deck, 1.0)
+
+
+        # self.deck_widgets[deck]["bpm_label"] = bpm_label
+
         return col
 
     def _make_vslider(self, text, min_v, max_v, init_v, on_change_cb):
@@ -163,11 +228,58 @@ class MainWindow(QtWidgets.QMainWindow):
             name = Path(path).name
             w["track_label"].setText(name)
             w["track_label"].setToolTip(path)
+           
+
+            bpm, conf, cands = estimate_bpm_dj(pcm, sr)
+            if bpm > 0:
+                self.base_bpm[deck] = float(bpm)
+                w["bpm_base_label"].setText(f"Base BPM: {bpm:.1f}")
+            else:
+                w["bpm_label"].setText("BPM: --")
+            self._update_bpm_display(deck)
+        
+        
+        peaks = waveform_peaks(pcm, samples_per_pixel=512)
+        x = np.arange(len(peaks))
+
+        # Waveform drawing 
+        plot_item = w["wave_plot"].getPlotItem()
+        plot_item.clear()
+        # draw bands
+        mins = peaks[:, 0]
+        maxs = peaks[:, 1]
+        plot_item.plot(x, maxs, pen=pg.mkPen('#4d90fe'))
+        plot_item.plot(x, mins, pen=pg.mkPen('#4d90fe'))
+        w["playhead_line"] = pg.InfiniteLine(
+            pos=0,
+            angle=90,
+            pen=pg.mkPen('y', width=2)
+        )
+        w["wave_plot"].addItem(w["playhead_line"])
+
+
+        for line in w["beat_lines"]:
+            w["wave_plot"].removeItem(line)
+        w["beat_lines"].clear()
+
+        # draw beat grid STIL NEED TO FIGURE OUT
+        # total_frames = len(pcm)
+        # for beat_frame in beat_frames:  # however you store them
+        #     idx = int((beat_frame / total_frames) * len(w["wave_peaks"]))
+        #     line = pg.InfiniteLine(
+        #         pos=idx,
+        #         angle=90,
+        #         pen=pg.mkPen('#ffaa00', width=1)
+        #     )
+        #     w["wave_plot"].addItem(line)
+        #     w["beat_lines"].append(line)
+
 
     def on_rate_change(self, deck: str, val: int):
         rate = val / 100.0
         self.engine.set_rate(deck, rate)
         self.deck_widgets[deck]["rate_label"].setText(f"{rate:.2f}x")
+        self._update_bpm_display(deck)
 
     def on_eq_change(self, deck: str):
         w = self.deck_widgets[deck]
@@ -199,10 +311,37 @@ class MainWindow(QtWidgets.QMainWindow):
             if w["seek_slider"].isEnabled() and not self.seeking[deck]:
                 pos = self.engine.get_position(deck)
                 w["seek_slider"].setValue(pos)
+                
+                pos_frames = self.engine.get_position(deck)
+                total_frames = self.engine.get_duration(deck)
+                peaks = w.get("wave_peaks")
+                if total_frames > 0 and peaks is not None:
+                    x = int((pos_frames / total_frames) * len(peaks))
+                    w["playhead_line"].setValue(x)
+        
+
 
     def closeEvent(self, event):
         self.engine.close()
         return super().closeEvent(event)
+    
+    def on_volume_change(self, deck: str, val: int):
+        gain = val / 100.0
+        self.engine.set_channel_gain(deck, gain)
+        self.deck_widgets[deck]["vol_label"].setText(f"{val}%")
+
+
+    def _update_bpm_display(self, deck: str):
+        base = float(self.base_bpm.get(deck, 0.0))
+        rate = float(self.deck_widgets[deck]["rate_slider"].value()) / 100.0
+
+        if base > 0:
+            cur = base * rate
+            self.deck_widgets[deck]["bpm_cur_label"].setText(f"BPM @ Rate: {cur:.1f}")
+        else:
+            self.deck_widgets[deck]["bpm_cur_label"].setText("BPM @ Rate: --")
+
+
 
 def run_app():
     app = QtWidgets.QApplication(sys.argv)
