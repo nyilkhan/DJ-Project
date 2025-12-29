@@ -2,3 +2,5 @@ PyQt6==6.7.1
 sounddevice==0.4.7
 numpy==2.0.1
 pydub==0.25.1
+pyqtgraph==0.13.1
+librosa==0.11.0
